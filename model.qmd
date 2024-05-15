@@ -1,0 +1,962 @@
+---
+title: "Association analysis"
+format: html
+date: "`r format(Sys.time(), '%d %B, %Y')`"    
+toc: true
+toc-expand: 3
+toc-location: left
+editor: source
+editor_options: 
+  chunk_output_type: console
+knitr:
+  opts_chunk: 
+    echo: true
+    message: false
+    warning: false
+    code-fold: true
+    include: true
+    collapse: true
+---
+
+```{r}
+#| label: setup-env
+
+# Set-up R environment
+rm(list=ls())
+library(tidyverse)
+library(magrittr)
+library(readxl)
+library(DT)
+library(arsenal)
+library(RColorBrewer)
+library(edgeR)
+library(plotly)
+library(kableExtra)
+library(ggpmisc)
+mycols <- brewer.pal(6, "Set1")
+library("xlsx")
+library(heatmap3)
+library(ggpubr)
+
+# load functions
+source("functions.R")
+
+# load data
+file <- "../data/processed/data.RData"
+load(file)
+genes_ofi <- c("DSG1", "ESR1", "PGR", "RPTN", "KRT1", "KRT2", "KRT10", "KRT76", "CDH1")
+
+df_anno <- df_ensmbl_annotated %>%
+  mutate(description = gsub("\\[.*", "", description))
+
+dir_inter <-"../intermediate/"
+dir_results <- "../results/"
+
+```
+
+<!-- # Dispertion estimation  -->
+
+```{r}
+# create edgeR objects
+
+# convert data frame into count matrix
+cols_rm <- c("Chr", "Start", "End", "Strand", "Length")
+
+m_v2 <- df_counts_v2 %>%
+  dplyr::select(-all_of(cols_rm)) %>%
+  column_to_rownames("Geneid") %>%
+  as.matrix()
+
+m_v3 <- df_counts_v3 %>%
+  dplyr::select(-all_of(cols_rm)) %>%
+  column_to_rownames("Geneid") %>%
+  as.matrix()
+
+# create edgeR object
+data_cds_v2 <- DGEList(m_v2)
+data_cds_v3 <- DGEList(m_v3)
+
+# filter genes by expression level
+keep <- filterByExpr(data_cds_v2, min.count = 10)
+data_cds_v2 <- data_cds_v2[keep,,keep.lib.sizes=FALSE]
+
+keep <- filterByExpr(data_cds_v3, min.count = 10)
+data_cds_v3 <- data_cds_v3[keep,,keep.lib.sizes=FALSE]
+
+# normalize
+data_cds_v2 <- calcNormFactors(data_cds_v2, method='TMM')
+data_norm_v2 <- cpm(data_cds_v2, prior.count=2, log=TRUE)
+
+data_cds_v3 <- calcNormFactors(data_cds_v3, method='TMM')
+data_norm_v3 <- cpm(data_cds_v3, prior.count=2, log=TRUE)
+
+counts_norm_v2 <- data_norm_v2 %>%
+  as_tibble(rownames = "ENSG")
+
+counts_norm_v3 <- data_norm_v3 %>%
+  as_tibble(rownames = "ENSG")
+
+# estimate dispersion
+file_disp <- paste(dir_inter, "edgeR-dispertion.Rdata", sep="")
+
+if(file.exists(file_disp) == FALSE){
+  
+  edgeR_v2 <- func_estimate_disp(df_meta = df_meta_v2, y = data_cds_v2)
+  edgeR_v3 <- func_estimate_disp(df_meta = df_meta_v3, y = data_cds_v3)
+  
+  save(edgeR_v2, edgeR_v3, file = file_disp)
+  
+}else{
+  
+  print("Found dispertion estimates: loading .Rdata")
+  load(file_disp)
+}
+```
+
+<!-- ::: panel-tabset -->
+
+<!-- ## V2 -->
+
+<!-- ```{r} -->
+
+<!-- #| label: fig-disp-v2 -->
+
+<!-- #| fig-cap: "Dispertion estimation: root-estimate i.e. the biological coefficient of variation for each gene." -->
+
+<!-- #| fig-align: center -->
+
+<!-- plotBCV(edgeR_v2$y) -->
+
+<!-- ``` -->
+
+<!-- ## V3 -->
+
+<!-- ```{r} -->
+
+<!-- #| label: fig-disp-v3 -->
+
+<!-- #| fig-cap: "Dispertion estimation: root-estimate i.e. the biological coefficient of variation for each gene." -->
+
+<!-- #| fig-align: center -->
+
+<!-- plotBCV(edgeR_v3$y) -->
+
+<!-- ``` -->
+
+<!-- ::: -->
+
+# Association analysis
+
+## V2
+
+### Overview
+
+```{r}
+#| label: tbl-overview-v2
+#| tbl-cap: "Overview of number of genes associated with E2 and P4 at various statistical threshold cut-offs, with and without correcton for multiple testing."
+
+y <- edgeR_v2$y
+design_matrix <- edgeR_v2$design_matrix
+
+# association analysis
+fit <- glmQLFit(y, design_matrix)
+
+# E2
+qlf_E2 <- glmQLFTest(fit, coef="E2")
+
+# P4
+qlf_P4 <- glmQLFTest(fit, coef="P4")
+
+E2 <- func_summarize_degs(qlf_E2)
+P4 <- func_summarize_degs(qlf_P4)
+
+degs_overview <- E2 %>%
+  left_join(P4, by = c("adj_method", "thr"), suffix = c("_E2", "_P4"))
+
+degs_overview %>%
+  dplyr::select(-"adj_method") %>%
+  kbl(caption =, col.names = c("thr", "down", "NS", "up", "down", "NS", "up"), booktabs = T, linesep = "", escape=FALSE) %>%
+  kable_paper(full_width = F) %>%
+  add_header_above(c(" ", "E2" = 3, "P4" = 3)) %>%
+  pack_rows(index = c("none" = 3, "BH" = 3)) %>%
+  footnote(number = c("None: no correction for multiple testing", "BH: Benjamini & Hochberg adjustment", "Down: decreasing trend", "Up: increasing trend"))
+
+```
+
+### Model coefficients estimates
+
+```{r}
+#| label: fig-model-v2
+#| fig-cap: "Preview of the estimated model coefficients including statistics for testing for genes associated with E2 and P4, ranked by genes with the smallest p-value for P4."
+
+# prepare table of model coefficients incl. p-values for E2
+E2_coeffs <- qlf_E2$coefficients %>%
+  as_tibble(rownames = "ENSG") 
+
+E2_tests <- topTags(qlf_E2, n = Inf)
+E2_tests <- E2_tests$table %>% 
+  as_tibble(rownames = "ENSG")
+
+E2_model <- E2_coeffs %>%
+  left_join(E2_tests, by = c("ENSG"))
+
+# prepare table of model coefficients incl. p-values for P4
+P4_coeffs <- qlf_P4$coefficients %>%
+  as_tibble(rownames = "ENSG") %>%
+  print()
+
+P4_tests <- topTags(qlf_P4, n = Inf)
+P4_tests <- P4_tests$table %>% 
+  as_tibble(rownames = "ENSG")
+
+P4_model <- P4_coeffs %>%
+  left_join(P4_tests, by = c("ENSG"))
+
+# join tables & add annotations
+model_E2_P4 <- E2_model %>%
+  left_join(P4_model, suffix = c("_E2", "_P4"), by = c("ENSG", "(Intercept)", "E2", "P4", "BV1", "BV2")) %>%
+  left_join(df_anno, by = c("ENSG" = "ensembl_gene_id")) 
+
+file_save <- "edgeR-model-v2.csv"
+file_save <-paste(dir_results, file_save, sep="")
+
+if(file.exists(file_save) == FALSE){
+  
+  model_E2_P4 %>%
+  dplyr::select(-gene) %>%
+    write_csv(file = file_save)
+  
+}else{
+  print(paste("Found file: ", file_save, ". Skipping saving .csv.", sep=""))
+}
+
+# preview results
+model_E2_P4 %>%
+  dplyr::select(-gene) %>%
+  arrange(PValue_P4) %>%
+  slice(1:100) %>%
+  datatable() %>%
+  formatSignif(columns = c(2:16), digits = 3)
+
+```
+
+Complete results saved in `r file_save`
+
+### Top hits
+
+#### E2
+
+```{r}
+#| label: tbl-top-hits-E2-v2
+#| tbl-cap: "Top genes associated with E2."
+
+# cols <- c("ENSG", "hgnc_symbol", "logFC_E2", "F_E2", "PValue_E2", "FDR_E2", "chromosome_name", "start_position", "end_position", "strand", "gene_biotype", "description")
+
+n_top <- 9
+top_E2 <- model_E2_P4 %>%
+  arrange(PValue_E2) %>%
+  dplyr::slice(1:n_top) #%>%
+  #select(all_of(cols))
+
+top_E2 %>%
+  kbl(digits = 3) %>%
+  kable_styling(full_width = T)
+
+```
+
+```{r}
+#| label: fig-top-hits-E2-v2
+#| fig-cap: "Normalized CPM values as a function of E2 for the top genes associated with E2."
+#| fig-align: center
+#| fig-width: 12
+#| fig-height: 12
+#| warning: false
+#| message: false
+
+top <- top_E2
+
+genes_ofi_ensg <- top %>%
+  pull(ENSG)
+
+data_norm <- data_norm_v2
+data_meta <- df_meta_v2
+
+df_genes_ofi <- data_norm[genes_ofi_ensg, ] %>% 
+  as_tibble(rownames = "ENSG") %>% 
+  pivot_longer(-ENSG, names_to = "PatID", values_to = "CPM") %>% 
+  left_join(data_meta) %>% 
+  mutate(ENSG = factor(ENSG, levels = genes_ofi_ensg)) %>%
+  print()
+
+p <- df_genes_ofi %>%
+  mutate(CPM = round(CPM, 2)) %>%
+  ggplot(aes(x = E2, y = CPM, group = "", label = PatID)) +
+  stat_poly_line(se = FALSE) + 
+  geom_point() + 
+  facet_wrap(~ENSG, scales = "free_y") + 
+  theme_bw() + 
+  xlab("E2, pg/ml") + 
+  theme(axis.text = element_text(size = 12), 
+        axis.title = element_text(size = 12))
+
+ggplotly(p, tooltip = c("x", "y", "PatID")) 
+
+
+```
+
+#### P4
+
+```{r}
+#| label: tbl-top-hits-P4-v2
+#| tbl-cap: "Top genes associated with P4."
+
+n_top <- 9
+top_P4 <- model_E2_P4 %>%
+  arrange(PValue_P4) %>%
+  dplyr::slice(1:n_top) #%>%
+  #select(all_of(cols))
+
+top_P4 %>%
+  kbl(digits = 3) %>%
+  kable_styling(full_width = T)
+
+```
+
+```{r}
+#| label: fig-top-hits-P4-v2
+#| fig-cap: "Normalized CPM values as a function of P4 for the top genes associated with P4."
+#| fig-align: center
+#| fig-width: 12
+#| fig-height: 12
+#| warning: false
+#| message: false
+
+top <- top_P4
+
+genes_ofi_ensg <- top %>%
+  pull(ENSG)
+
+data_norm <- data_norm_v2
+data_meta <- df_meta_v2
+
+df_genes_ofi <- data_norm[genes_ofi_ensg, ] %>% 
+  as_tibble(rownames = "ENSG") %>% 
+  pivot_longer(-ENSG, names_to = "PatID", values_to = "CPM") %>% 
+  left_join(data_meta) %>% 
+  mutate(ENSG = factor(ENSG, levels = genes_ofi_ensg)) %>%
+  print()
+
+
+p <- df_genes_ofi %>%
+  mutate(CPM = round(CPM, 2)) %>%
+  ggplot(aes(x = P4, y = CPM, group = "", label = PatID)) +
+  stat_poly_line(se = FALSE) + 
+  geom_point() + 
+  facet_wrap(~ENSG, scales = "free_y") + 
+  theme_bw() + 
+  xlab("P4, ng/ml") + 
+  theme(axis.text = element_text(size = 12), 
+        axis.title = element_text(size = 12))
+
+ggplotly(p, tooltip = c("x", "y", "PatID")) 
+
+
+```
+
+### E2 and P4 overlap
+
+```{r}
+#| label: tbl-overlap-v2
+#| tbl-cap: "Number of overlapping genes associated both with E2 and P4 for different thresholds of significance, based on unadjusted p-values."
+
+
+thr <- c(0.05, 0.01, 0.001)
+v_overlap <- c()
+for (i in seq_along(thr)){
+  v_overlap[i] <- func_E2_P4_overlap(thr[i], model_E2_P4$PValue_E2, model_E2_P4$PValue_P4)
+}
+
+
+df_overlap <- data.frame(thr = thr, overlap = v_overlap)
+df_overlap %>%
+  kbl() %>%
+  kable_styling(full_width = TRUE)
+
+
+```
+
+## V3
+
+### Overview
+
+```{r}
+#| label: tbl-overview-v3
+#| tbl-cap: "Overview of number of genes associated with E2 and P4 at various statistical threshold cut-offs, with and without correcton for multiple testing."
+
+y <- edgeR_v3$y
+design_matrix <- edgeR_v3$design_matrix
+
+# association analysis
+fit <- glmQLFit(y, design_matrix)
+
+# E2
+qlf_E2 <- glmQLFTest(fit, coef="E2")
+
+# P4
+qlf_P4 <- glmQLFTest(fit, coef="P4")
+
+E2 <- func_summarize_degs(qlf_E2)
+P4 <- func_summarize_degs(qlf_P4)
+
+degs_overview <- E2 %>%
+  left_join(P4, by = c("adj_method", "thr"), suffix = c("_E2", "_P4"))
+
+degs_overview %>%
+  dplyr::select(-"adj_method") %>%
+  kbl(caption =, col.names = c("thr", "down", "NS", "up", "down", "NS", "up"), booktabs = T, linesep = "", escape=FALSE) %>%
+  kable_paper(full_width = F) %>%
+  add_header_above(c(" ", "E2" = 3, "P4" = 3)) %>%
+  pack_rows(index = c("none" = 3, "BH" = 3)) %>%
+  footnote(number = c("None: no correction for multiple testing", "BH: Benjamini & Hochberg adjustment", "Down: decreasing trend", "Up: increasing trend"))
+
+```
+
+### Model coefficients estimates
+
+```{r}
+#| label: fig-model-v3
+#| fig-cap: "Preview of the estimated model coefficients including statistics for testing for genes associated with E2 and P4, ranked by genes with the smallest p-value for P4."
+
+# prepare table of model coefficients incl. p-values for E2
+E2_coeffs <- qlf_E2$coefficients %>%
+  as_tibble(rownames = "ENSG") 
+
+E2_tests <- topTags(qlf_E2, n = Inf)
+E2_tests <- E2_tests$table %>% 
+  as_tibble(rownames = "ENSG")
+
+E2_model <- E2_coeffs %>%
+  left_join(E2_tests, by = c("ENSG"))
+
+# prepare table of model coefficients incl. p-values for P4
+P4_coeffs <- qlf_P4$coefficients %>%
+  as_tibble(rownames = "ENSG") %>%
+  print()
+
+P4_tests <- topTags(qlf_P4, n = Inf)
+P4_tests <- P4_tests$table %>% 
+  as_tibble(rownames = "ENSG")
+
+P4_model <- P4_coeffs %>%
+  left_join(P4_tests, by = c("ENSG"))
+
+# join tables & add annotations
+model_E2_P4 <- E2_model %>%
+  left_join(P4_model, suffix = c("_E2", "_P4"), by = c("ENSG", "(Intercept)", "E2", "P4", "BV1", "BV2")) %>%
+  left_join(df_anno, by = c("ENSG" = "ensembl_gene_id")) 
+
+file_save <- "edgeR-model-v3.csv"
+file_save <-paste(dir_results, file_save, sep="")
+
+if(file.exists(file_save) == FALSE){
+  
+  model_E2_P4 %>%
+  dplyr::select(-gene) %>%
+    write_csv(file = file_save)
+  
+}else{
+  print(paste("Found file: ", file_save, ". Skipping saving .csv.", sep=""))
+}
+
+# preview results
+model_E2_P4 %>%
+  dplyr::select(-gene) %>%
+  arrange(PValue_P4) %>%
+  slice(1:100) %>%
+  datatable() %>%
+  formatSignif(columns = c(2:16), digits = 3)
+
+```
+
+Complete results saved in `r file_save`
+
+### Top hits
+
+#### E2
+
+```{r}
+#| label: tbl-top-hits-E2-v3
+#| tbl-cap: "Top genes associated with E2."
+
+# cols <- c("ENSG", "hgnc_symbol", "logFC_E2", "F_E2", "PValue_E2", "FDR_E2", "chromosome_name", "start_position", "end_position", "strand", "gene_biotype", "description")
+
+n_top <- 9
+top_E2 <- model_E2_P4 %>%
+  arrange(PValue_E2) %>%
+  dplyr::slice(1:n_top) #%>%
+  #select(all_of(cols))
+
+top_E2 %>%
+  kbl(digits = 3) %>%
+  kable_styling(full_width = T)
+
+```
+
+```{r}
+#| label: fig-top-hits-E2-v3
+#| fig-cap: "Normalized CPM values as a function of E2 for the top genes associated with E2."
+#| fig-align: center
+#| fig-width: 12
+#| fig-height: 12
+#| warning: false
+#| message: false
+
+top <- top_E2
+
+genes_ofi_ensg <- top %>%
+  pull(ENSG)
+
+data_norm <- data_norm_v3
+data_meta <- df_meta_v3
+
+df_genes_ofi <- data_norm[genes_ofi_ensg, ] %>% 
+  as_tibble(rownames = "ENSG") %>% 
+  pivot_longer(-ENSG, names_to = "PatID", values_to = "CPM") %>% 
+  left_join(data_meta) %>% 
+  mutate(ENSG = factor(ENSG, levels = genes_ofi_ensg)) %>%
+  print()
+
+
+p <- df_genes_ofi %>%
+  mutate(CPM = round(CPM, 2)) %>%
+  ggplot(aes(x = E2, y = CPM, group = "", label = PatID)) +
+  stat_poly_line(se = FALSE) + 
+  geom_point() + 
+  facet_wrap(~ENSG, scales = "free_y") + 
+  theme_bw() + 
+  xlab("E2, pg/ml") + 
+  theme(axis.text = element_text(size = 12), 
+        axis.title = element_text(size = 12))
+
+ggplotly(p, tooltip = c("x", "y", "PatID")) 
+
+
+```
+
+#### P4
+
+```{r}
+#| label: tbl-top-hits-P4-v3
+#| tbl-cap: "Top genes associated with P4."
+
+n_top <- 9
+top_P4 <- model_E2_P4 %>%
+  arrange(PValue_P4) %>%
+  dplyr::slice(1:n_top) #%>%
+  #select(all_of(cols))
+
+top_P4 %>%
+  kbl(digits = 3) %>%
+  kable_styling(full_width = T)
+
+```
+
+```{r}
+#| label: fig-top-hits-P4-v3
+#| fig-cap: "Normalized CPM values as a function of P4 for the top genes associated with P4."
+#| fig-align: center
+#| fig-width: 12
+#| fig-height: 12
+#| warning: false
+#| message: false
+
+top <- top_P4
+
+genes_ofi_ensg <- top %>%
+  pull(ENSG)
+
+
+df_genes_ofi <- data_norm[genes_ofi_ensg, ] %>% 
+  as_tibble(rownames = "ENSG") %>% 
+  pivot_longer(-ENSG, names_to = "PatID", values_to = "CPM") %>% 
+  left_join(data_meta) %>% 
+  mutate(ENSG = factor(ENSG, levels = genes_ofi_ensg)) %>%
+  print()
+
+
+p <- df_genes_ofi %>%
+  mutate(CPM = round(CPM, 2)) %>%
+  ggplot(aes(x = P4, y = CPM, group = "", label = PatID)) +
+  stat_poly_line(se = FALSE) + 
+  geom_point() + 
+  facet_wrap(~ENSG, scales = "free_y") + 
+  theme_bw() + 
+  xlab("P4, ng/ml") + 
+  theme(axis.text = element_text(size = 12), 
+        axis.title = element_text(size = 12))
+
+ggplotly(p, tooltip = c("x", "y", "PatID")) 
+
+
+```
+
+### E2 and P4 overlap
+
+#### no adj
+
+```{r}
+#| label: tbl-overlap-v3
+#| tbl-cap: "Number of overlapping genes associated both with E2 and P4 for different thresholds of significance, based on unadjusted p-values."
+
+thr <- c(0.05, 0.01, 0.001)
+v_overlap <- c()
+for (i in seq_along(thr)){
+  v_overlap[i] <- func_E2_P4_overlap(thr[i], model_E2_P4$PValue_E2, model_E2_P4$PValue_P4)
+}
+
+df_overlap <- data.frame(thr = thr, overlap = v_overlap)
+df_overlap %>%
+  kbl() %>%
+  kable_styling(full_width = TRUE)
+
+```
+
+#### fdr adj
+
+```{r}
+#| label: tbl-overlap-fdr-v3
+#| tbl-cap: "Number of overlapping genes associated both with E2 and P4 for different thresholds of significance, based on unadjusted p-values."
+
+thr <- c(0.05, 0.01, 0.001)
+v_overlap <- c()
+for (i in seq_along(thr)){
+  v_overlap[i] <- func_E2_P4_overlap(thr[i], model_E2_P4$FDR_E2, model_E2_P4$FDR_P4)
+}
+
+df_overlap <- data.frame(thr = thr, overlap = v_overlap)
+df_overlap %>%
+  kbl() %>%
+  kable_styling(full_width = TRUE)
+
+```
+
+
+# MS figures
+
+## Genes
+```{r}
+#| label: fig-for-MS-v3
+#| fig-cap: "Normalized CPM values as a function of E2."
+#| fig-align: center
+#| fig-width: 12
+#| fig-height: 12
+
+# prepare data for plotting
+genes_ofi <- c("DSG1", "KRT6C", "KRT76")
+data_norm <- data_norm_v3
+data_meta <- df_meta_v3
+
+genes_ofi_ensg <- df_ensmbl_annotated %>%
+  filter(hgnc_symbol %in% genes_ofi) %>%
+  dplyr::select(ensembl_gene_id, hgnc_symbol) %>%
+  rename(ENSG = ensembl_gene_id)
+
+df_genes_ofi <- data_norm[genes_ofi_ensg$ENSG, ] %>%
+  as_tibble(rownames = "ENSG") %>% 
+  pivot_longer(-ENSG, names_to = "PatID", values_to = "CPM") %>%
+  left_join(data_meta) %>% 
+  left_join(genes_ofi_ensg) %>% 
+  mutate(hgnc_symbol = factor(hgnc_symbol, levels = genes_ofi)) %>%
+  print()
+
+# calculate correlations
+r <- p <- c()
+for (i in 1:length(genes_ofi)){
+  df <- df_genes_ofi %>%
+  filter(hgnc_symbol == genes_ofi[i])
+  
+  r[i] <- round(cor(df$E2, df$CPM), 2)
+  p[i] <- cor.test(df$E2, df$CPM)$p.value
+}
+
+p_adj <- p.adjust(p, method = "BH") %>%
+  round(6)
+
+# make individual plots per gene
+ymin <- df_genes_ofi$CPM %>% min()
+ymax <- df_genes_ofi$CPM %>% max() + 3
+
+h1 <- ymax 
+h2 <- ymax - 1.5
+
+mytheme <- theme(axis.text = element_text(size = 6), 
+                 axis.title = element_text(size = 6), 
+                 title = element_text(size = 6))
+
+size_anno <- 2.5
+size_anno2 <- 2.5
+size_point <- 1.5
+
+i <- 1
+label <- paste("R = ", r[i], ", p = ", p_adj[i], sep="")
+df <- df_genes_ofi %>%
+  filter(hgnc_symbol == "DSG1")
+p1 <- ggscatter(df, x = "E2", y = "CPM",
+   color = "black", shape = 21, size = size_point,  fill = "lightblue", alpha = 0.7,
+   add = "reg.line",  
+   ggtheme = theme_pubr(),
+   ) + 
+  stat_cor(label.x = 3, label.y = h1, size = size_anno2) +
+  stat_regline_equation(label.x = 3, label.y = h2, size = size_anno2) + 
+  ylab("logCPM") + 
+  xlab("E2 (pg/ml)") + 
+  ylim(c(5, ymax)) + 
+  ggtitle("DSG1") + 
+  mytheme 
+
+i <- 2
+label <- paste("R = ", r[i], ", p = ", p_adj[i], sep="")
+df <- df_genes_ofi %>%
+  filter(hgnc_symbol == "KRT6C")
+p2 <- ggscatter(df, x = "E2", y = "CPM",
+   color = "black", shape = 21, size = size_point,  fill = "lightblue", alpha = 0.7,
+   add = "reg.line",  
+   add.params = list(size = 0.8, color = "gray3"), 
+   ggtheme = theme_pubr(),
+   ) + 
+  stat_cor(label.x = 3, label.y = h1, size = size_anno2) +
+  stat_regline_equation(label.x = 3, label.y = h2, size = size_anno2) + 
+  ylab("logCPM") + 
+  xlab("E2 (pg/ml)") + 
+  ylim(c(5, ymax)) + 
+  ggtitle("KRT6C") + 
+  mytheme 
+
+i <- 3
+label <- paste("R = ", r[i], ", p = ", p_adj[i], sep="")
+df <- df_genes_ofi %>%
+  filter(hgnc_symbol == "KRT76")
+p3 <- ggscatter(df, x = "E2", y = "CPM",
+   color = "black", shape = 21, size = size_point,  fill = "lightblue", alpha = 0.7, 
+   add = "reg.line",  
+   ggtheme = theme_pubr(),
+   ) + 
+  stat_cor(label.x = 3, label.y = h1+1, size = size_anno2) +
+  stat_regline_equation(label.x = 3, label.y = h2, size = size_anno2) + 
+  ylab("logCPM") + 
+  xlab("E2 (pg/ml)") + 
+  ylim(c(ymin - 1, 18)) + 
+  ggtitle("KRT76") + 
+  mytheme 
+#graphics.off()
+
+pdf(file = "E2-vs-genes-v3-ver-1.pdf", width = 7.48, height = 2.5)
+ggarrange(p1, p2, p3, ncol = 3, common.legend = TRUE, labels = "")
+dev.off()
+
+pdf(file = "E2-vs-genes-v3-ver-2.pdf", width = 2,  height = 5.5)
+ggarrange(p1, p2, p3, ncol = 1, common.legend = TRUE, labels = "")
+dev.off()
+
+```
+
+## Heatmap
+
+```{r}
+#| include: false
+#| eval: false
+
+# for genes FDR < 0.05
+# E2 levels
+
+# association results
+dim(model_E2_P4)
+
+# find DEGs for specific significance level (0.05) and p values correction ("fdr")
+y <- edgeR_v3$y
+design_matrix <- edgeR_v3$design_matrix
+fit <- glmQLFit(y, design_matrix)
+qlf_E2 <- glmQLFTest(fit, coef="E2")
+degs <- decideTestsDGE(qlf_E2, adjust.method = "fdr", p.value = 0.05)
+
+top_table <- qlf_E2$table %>%
+  as_tibble(rownames = "ENSG")
+
+df_degs_E2 <- degs %>%
+  data.frame() %>%
+  as_tibble(rownames = "ENSG") %>%
+  rename(degs = E2) %>%
+  filter(degs != 0) %>%
+  left_join(top_table) %>%
+  left_join(df_anno, by = c("ENSG" = "ensembl_gene_id")) %>%
+  mutate(name = ifelse(hgnc_symbol == "", ENSG, hgnc_symbol))
+
+# change to P00X patients id
+data_norm <- data_norm_v3
+df_meta <- df_meta_v3
+idx <- match(colnames(data_norm), df_meta$PatID)
+colnames_new <- df_meta$PatIDPx[idx]
+data_norm_fm <- data_norm
+colnames(data_norm_fm) <- colnames_new
+
+# order samples starting with the highest E2 value
+o <- order(df_meta$E2, decreasing = T)
+
+# data plot
+data_plot <- 
+  data_norm_fm[df_degs_E2$ENSG, o] 
+
+ColSideAnn <- data.frame(E2 = df_meta_v3$E2[o])
+rownames(ColSideAnn) <- colnames(data_plot)
+print(head(ColSideAnn))
+
+mycols <- brewer.pal(6, "Set1")
+mycols_cat <- brewer.pal(6,"Dark2")
+cols_wong <- c("#0072b2", "#e69f00", "#56b4e9", "#009e73", "#f0e442")
+
+graphics.off()
+pdf(file = "heatmap-E2-part-a.pdf", height = 10, width = 5)
+heatmap3(data_plot, 
+         #Colv = NA, 
+         scale = "row", 
+         showColDendro = F,
+         ColSideAnn=ColSideAnn, 
+         ColSideFun=function(x) showAnn(x),
+         ColSideWidth=1, 
+         col=colorRampPalette(c(cols_wong[1],"white", cols_wong[2]))(124), 
+         labRow = F, 
+         labCol = F, 
+         #margins=c(2,4), 
+         reorderfun = function(d, w) reorder(d, w, agglo.FUN = mean))
+dev.off()
+```
+
+```{r}
+
+
+degs_subset <- df_degs_E2 %>%
+  group_by(degs) %>%
+  arrange(desc(abs(logFC))) %>%
+  slice(1:25) %>%
+  ungroup()
+
+data_plot <- 
+  data_norm_fm[degs_subset$ENSG, o] 
+
+rownames(data_plot) <- degs_subset$name
+
+ColSideAnn <- data.frame(E2 = df_meta_v3$E2[o])
+rownames(ColSideAnn) <- df_meta$PatIDPx
+print(head(ColSideAnn))
+
+mycols <- brewer.pal(6, "Set1")
+mycols_cat <- brewer.pal(6,"Dark2")
+cols_wong <- c("#0072b2", "#e69f00", "#56b4e9", "#009e73", "#f0e442")
+
+#graphics.off()
+#pdf(file = "heatmap-idea-02.pdf")
+
+hc <- hclust(dist(data_plot))
+dd <- as.dendrogram(hc)
+
+pdf(file = "heatmap-E2-part-b.pdf", height = 10, width = 5)
+heatmap3(data_plot,
+         #Colv = NA,
+         scale = "row",
+         showRowDendro = T,
+         showColDendro = F,
+         ColSideAnn=ColSideAnn,
+         ColSideFun=function(x) showAnn(x),
+         ColSideWidth=1,
+         col=colorRampPalette(c(cols_wong[1],"white", cols_wong[2]))(124),
+         labCol = NA,
+         #labRow = rep(1:nrow(data_plot)),
+         reorderfun = function(d, w) reorder(d, w[66:1], agglo.FUN = mean),
+         cexRow = 0.5)
+        #col=colorRampPalette(c(mycols[2],"white", mycols[1]))(100))
+dev.off()
+
+```
+
+
+```{r}
+require(graphics)
+
+set.seed(123)
+x <- rnorm(10)
+hc <- hclust(dist(x))
+dd <- as.dendrogram(hc)
+dd.reorder <- reorder(dd, 10:1)
+
+op <- par(mfcol = 1:2)
+plot(dd, main = "random dendrogram 'dd'")
+plot(dd.reorder, main = "reorder(dd, 10:1)")
+#plot(reorder(dd, 10:1, agglo.FUN = mean), main = "reorder(dd, 10:1, mean)")
+par(op)
+```
+
+
+# Manuscript table format {.unnumbered .unlisted}
+
+```{r}
+#| label: v2
+# save normalized counts with gene expression and P00X ID
+
+# change to P00X patients id
+data_norm <- data_norm_v2
+df_meta <- df_meta_v2
+file_out <- "../results/data-norm-PatIDPx-v2.csv"
+
+idx <- match(colnames(data_norm), df_meta$PatID)
+colnames_new <- df_meta$PatIDPx[idx]
+data_norm_fm <- data_norm
+colnames(data_norm_fm) <- colnames_new
+
+df_norm <- as_tibble(data_norm_fm, rownames = "ensembl_gene_id")
+
+# add gene information
+genes <- data.frame(ensembl_gene_id = rownames(data_norm))
+genes_desc <- genes %>%
+  left_join(df_anno)
+
+df_out <- genes_desc %>%
+  left_join(df_norm)
+  
+write_delim(df_out, file_out, delim = ",")
+
+```
+
+```{r}
+#| label: v3
+# save normalized counts with gene expression and P00X ID
+
+# change to P00X patients id
+data_norm <- data_norm_v3
+df_meta <- df_meta_v3
+file_out <- "../results/data-norm-PatIDPx-v3.csv"
+
+idx <- match(colnames(data_norm), df_meta$PatID)
+colnames_new <- df_meta$PatIDPx[idx]
+data_norm_fm <- data_norm
+colnames(data_norm_fm) <- colnames_new
+
+df_norm <- as_tibble(data_norm_fm, rownames = "ensembl_gene_id")
+
+# add gene information
+genes <- data.frame(ensembl_gene_id = rownames(data_norm))
+genes_desc <- genes %>%
+  left_join(df_anno)
+
+df_out <- genes_desc %>%
+  left_join(df_norm)
+  
+write_delim(df_out, file_out, delim = ",")
+
+```
+
+# Session info {.unnumbered}
+
+```{r}
+#| code-fold: true
+print(sessionInfo())
+```

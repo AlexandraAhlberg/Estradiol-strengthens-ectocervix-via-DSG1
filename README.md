@@ -1,4 +1,6 @@
 # Estradiol-strengthens-ectocervix-via-DSG1
+Scripts used for the RNA-sequencing analysis can be found here. 
+
 Introduction: Structural integrity of the cervical epithelial barrier is crucial for defending the female reproductive tract against sexually transmitted infections, including HIV. Female sex hormones, estradiol and progesterone, play an important role in modulating this epithelial barrier. However, the influence of fluctuating estradiol and progesterone on ectocervical tissue gene and protein expression in naturally cycling women at high risk for sexually transmitted infections is not well understood. 
 
 Methods: Ectocervical biopsies, cervicovaginal lavage fluid, and venous blood samples were collected from naturally cycling Kenyan female sex workers at two time points, separated by 2 weeks. The first time point represented the luteal phase of the menstrual cycle and the second time point represented the follicular phase. Plasma estradiol and progesterone levels were measured at each time point. Ectocervical tissues were analyzed by RNA-sequencing and in situ immunofluorescence staining. Cervicovaginal lavage samples were evaluated using antibody-based protein profiling. 

@@ -1,0 +1,727 @@
+---
+title: "Hormone Project"
+author: "Zaynab Mousavian"
+date: "Oct. 2022"
+output:
+  pdf_document: default
+  html_document:
+    theme:
+      bg: white
+      fg: black
+      base_font:
+        google: Prompt
+subtitle: Co-expression Network Analysis
+---
+
+
+```{r setup, include=TRUE,message=FALSE,warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE,message = FALSE,warning = FALSE)
+```
+
+# 1. Loading all data and packages  
+
+```{r setup, include=TRUE,message=FALSE,warning=FALSE}
+library(WGCNA)
+library(flashClust)
+library(ggplot2)
+library(reshape)
+library(ggrepel)
+library(ggpubr)
+library(dplyr)
+library(readxl)
+
+corMeasure <- "bicor"
+networkType <- "signed hybrid"
+inputDirectory <- paste0("data/data-June/")
+resultsDirectory <- paste0("Results/data-June-V3/Results_Oct/",corMeasure,"-",networkType,"onlyHC")
+options(stringsAsFactors = FALSE)
+
+dat_Expr <- read.csv(paste0(inputDirectory,"counts-norm-v3.csv"))
+dat_Traits <- read_excel(paste0(inputDirectory,"clinicalData_V3.xlsx"))
+dat_Regression <- read.csv(paste0(inputDirectory,"edgeR-model-v3.csv"))
+proteinGenes <- dat_Regression[which(dat_Regression$gene_biotype=="protein_coding"),"ENSG"]
+dat_Expr <- dat_Expr[which(dat_Expr$gene%in%proteinGenes),]
+
+dat_Traits <- as.data.frame(dat_Traits)
+names(dat_Traits) <- dat_Traits[1,]
+dat_Traits <- dat_Traits[-1,]
+patientIDs <- dat_Traits$PatID
+dat_Traits <- dat_Traits[,c("Plasma_S_Estradiol_pg_mL_v3","Plasma_S_Prog_ng_mL_v3")]
+names(dat_Traits) <- c("Estradiol","Progesterone")
+dat_Traits<- data.frame(apply(dat_Traits, 2, function(x) as.numeric(as.character(x))))
+row.names(dat_Traits) <- patientIDs
+row.names(dat_Expr) <- dat_Expr$gene
+dat_Expr <- dat_Expr[,-1]
+names(dat_Expr) <- gsub("X","",names(dat_Expr))
+
+dat_Expr$mad = apply(dat_Expr,1,function(x) mad(x))
+sortedGenes = dat_Expr$mad
+names(sortedGenes) = row.names(dat_Expr)
+sortedGenes = sort(sortedGenes,decreasing = TRUE)
+selectedGenes = names(sortedGenes[1:5000])
+dat_Expr = dat_Expr[selectedGenes,]
+dat_Expr = dat_Expr[,-ncol(dat_Expr)]
+
+head(dat_Expr)
+head(dat_Traits)
+
+boxplot(dat_Expr)
+```
+
+# 2. Sample clustering 
+
+```{r}
+datExpr0 = as.data.frame(t(dat_Expr))
+names(datExpr0) = row.names(dat_Expr)
+rownames(datExpr0) = colnames(dat_Expr)
+
+gsg = goodSamplesGenes(datExpr0, verbose = 0);
+gsg$allOK
+
+if (!gsg$allOK)
+{
+  # Optionally, print the gene and sample names that were removed:
+  if (sum(!gsg$goodGenes)>0)
+    printFlush(paste("Removing genes:", paste(names(datExpr0)[!gsg$goodGenes], 
+                                              collapse = ", ")));
+  if (sum(!gsg$goodSamples)>0)
+    printFlush(paste("Removing samples:", paste(rownames(datExpr0)[!gsg$goodSamples],
+                                              collapse = ", ")));
+  # Remove the offending genes and samples from the data:
+  datExpr0 = datExpr0[gsg$goodSamples, gsg$goodGenes]
+}
+
+nHC=nrow(datExpr0)
+row.names(datExpr0)=c(paste0("HC0",1:9),paste0("HC",10:nHC))
+row.names(dat_Traits)=c(paste0("HC0",1:9),paste0("HC",10:nHC))
+
+sampleTree = flashClust(dist(datExpr0), method = "average");
+# Plot the sample tree: Open a graphic output window of size 12 by 9 inches
+# The user should change the dimensions if the window is too large or too small.
+
+pdf(file = paste0(resultsDirectory,"SampleClustering.pdf"), width = 15, height = 9);
+par(cex = 2);
+par(mar = c(1,6,2,0))
+
+traitColors=c(rep("#E48725",nHC))
+plotDendroAndColors(sampleTree,traitColors,groupLabels="",main = "Sample clustering to detect outliers", sub="", xlab="", cex.main=2, cex.dendroLabels = 1.5,cex.rowText = 1,face=1)
+
+# Plot a line to show the cut
+abline(h = 120, col = "red");
+
+# Determine cluster under the line
+clust = cutreeStatic(sampleTree, cutHeight = 120, minSize = 10)
+table(clust)
+# clust 1 contains the samples we want to keep.
+keepSamples = (clust==1)
+datExpr = datExpr0[keepSamples, ]
+datTraits = dat_Traits[keepSamples,,drop=FALSE]
+nGenes = ncol(datExpr)
+nSamples = nrow(datExpr)
+
+# Re-cluster samples
+sampleTree2 = flashClust(dist(datExpr), method = "average")
+# Convert traits to a color representation: white means low, red means high, grey means missing entry
+traitColors = numbers2colors(datTraits, signed = FALSE);
+
+# Plot the sample dendrogram and the colors underneath.
+plotDendroAndColors(sampleTree2, traitColors,
+                    groupLabels = names(datTraits),
+                    main = "Sample dendrogram and trait heatmap",cex.main=2)
+abline(h = 150, col = "red");
+dev.off()
+save(datExpr,datTraits,file=paste0(resultsDirectory,"dataInput.RData"))
+```
+
+# 3.Choosing the soft-thresholding power 
+
+```{r}
+load(paste0(resultsDirectory,"dataInput.RData"))
+# Choose a set of soft-thresholding powers
+powers = c(c(1:10), seq(from = 12, to=20, by=2))
+
+# Call the network topology analysis function
+pearsonFunc<- function(){
+  sft <<- pickSoftThreshold(datExpr, powerVector = powers, verbose = 0,
+                            networkType=networkType)
+}
+bicorFunc<- function(){
+  sft <<- pickSoftThreshold(datExpr, powerVector = powers, verbose = 0, corFnc="bicor",
+                            networkType=networkType, corOptions = list(maxPOutliers =0.1))
+}
+ifelse(corMeasure=="bicor",bicorFunc(),pearsonFunc())
+
+# Plot the results:
+pdf(file=paste0(resultsDirectory,"ScaleFreeTopology.pdf"),width=9,height=5)
+
+par(mfrow = c(1,2));
+cex1 = 0.5;
+# Scale-free topology fit index as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+     main = paste("Scale independence"),cex.main=0.7,cex.lab=1,cex.axis=0.7);
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers,cex=1,col="red");
+# this line corresponds to using an R^2 cut-off of h
+abline(h=0.90,col="red")
+# Mean connectivity as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+     main = paste("Mean connectivity"),cex.main=0.7,cex.lab=1,cex.axis=0.7)
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=1,col="red")
+dev.off()
+```
+
+# 4.Co-expression network construction and clustering the network into modules
+
+```{r}
+softPower = sft$powerEstimate;
+softPower <- ifelse(is.na(softPower),4,softPower)
+softPower = 6
+pearsonAdjancecy <- function(){
+  adjacencyMat <<- adjacency(datExpr, power = softPower, type=networkType);
+}
+bicorAdjancecy <- function(){
+adjacencyMat <<- adjacency(datExpr, power = softPower, corFnc="bicor", type=networkType
+                           ,corOptions="maxPOutliers = 0.1");
+}
+ifelse(corMeasure=="bicor",bicorAdjancecy(),pearsonAdjancecy())
+
+# Turn adjacency into topological overlap
+TOM = TOMsimilarity(adjacencyMat,TOMType="signed");
+dissTOM = 1-TOM
+
+# Call the hierarchical clustering function
+geneTree = flashClust(as.dist(dissTOM), method = "average");
+# Plot the resulting clustering tree (dendrogram)
+pdf(file=paste0(resultsDirectory,"GeneClustering.pdf"),width=12,height=9)
+plot(geneTree, xlab="", sub="", main = "Gene clustering on TOM-based dissimilarity",
+     labels = FALSE, hang = 0.04);
+
+# We like large modules, so we set the minimum module size relatively high:
+minModuleSize = 40;
+# Module identification using dynamic tree cut:
+dynamicMods = cutreeDynamic(dendro = geneTree, distM = dissTOM,
+                             deepSplit = 2, pamRespectsDendro = FALSE,
+                            minClusterSize = minModuleSize);
+table(dynamicMods)
+# Convert numeric lables into colors
+dynamicColors = labels2colors(dynamicMods)
+table(dynamicColors)
+# Plot the dendrogram and colors underneath
+#sizeGrWindow(8,6)
+plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05,
+                    main = "Gene dendrogram and module colors")
+dev.off()
+```
+
+# 5. Merging of close modules
+
+```{r}
+# Calculate eigengenes
+MEList = moduleEigengenes(datExpr, colors = dynamicColors)
+MEs = MEList$eigengenes
+# Calculate dissimilarity of module eigengenes
+MEDiss = 1-cor(MEs);
+# Cluster module eigengenes
+METree = flashClust(as.dist(MEDiss), method = "average");
+# Plot the result
+pdf(file=paste0(resultsDirectory,"modulesClustering.pdf"),width=7,height=6)
+
+plot(METree, main = "Clustering of module eigengenes",
+     xlab = "", sub = "")
+MEDissThres = 0.25
+# Plot the cut line into the dendrogram
+abline(h=MEDissThres, col = "red")
+# Call an automatic merging function
+merge = mergeCloseModules(datExpr, dynamicColors, cutHeight = MEDissThres, verbose = 0)
+# The merged module colors
+mergedColors = merge$colors;
+# Eigengenes of the new merged modules:
+mergedMEs = merge$newMEs;
+
+
+MEList = moduleEigengenes(datExpr, colors = mergedColors)
+MEs = MEList$eigengenes
+# Calculate dissimilarity of module eigengenes
+MEDiss = 1-cor(MEs);
+# Cluster module eigengenes
+METree = flashClust(as.dist(MEDiss), method = "average");
+# Plot the result
+plot(METree, main = "Clustering of module eigengenes",
+     xlab = "", sub = "")
+
+sizeGrWindow(12, 9)
+plotDendroAndColors(geneTree, cbind(dynamicColors, mergedColors),
+                    c("Dynamic Tree Cut", "Merged dynamic"),
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+# Rename to moduleColors
+moduleColors = mergedColors
+# Construct numerical labels corresponding to the colors
+colorOrder = c("grey", standardColors(50));
+moduleLabels = match(moduleColors, colorOrder)-1;
+MEs = mergedMEs;
+dev.off()
+```
+
+# 6. Quantifying module-trait associations
+
+```{r}
+# Define numbers of genes and samples
+nGenes = ncol(datExpr);
+nSamples = nrow(datExpr);
+# Recalculate MEs with color labels
+MEs0 = moduleEigengenes(datExpr, moduleColors)$eigengenes
+MEs = orderMEs(MEs0)
+moduleTraitCor = cor(MEs, datTraits, use = "p");
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor, nSamples);
+moduleTraitFDR=p.adjust(moduleTraitPvalue,method="fdr")
+pdf(file=paste0(resultsDirectory,"ModuleTraits.pdf"),width=8,height=2.7)
+
+# Will display correlations and their p-values
+textMatrix = paste(signif(moduleTraitCor, 2), "\n(",
+                   signif(moduleTraitFDR, 1), ")", sep = "");
+dim(textMatrix) = dim(moduleTraitCor)
+par(mar = c(6, 8.5, 3, 3));
+
+m1=t(moduleTraitCor)
+m2=t(textMatrix)
+p=labeledHeatmap(Matrix = m1,
+               xLabels = names(MEs),
+               yLabels = names(datTraits),
+               xSymbols = names(MEs),
+               colorLabels = FALSE,
+               colors = greenWhiteRed(50),
+               textMatrix = m2,
+               setStdMargins = FALSE,
+               cex.text = 0.6,
+               cex.main = 0.7,
+               cex.axis=0.7,
+               cex.lab=0.5,
+               cex.lab.x = 0.7,
+               cex.lab.y = 0.7,
+               zlim = c(-1,1),
+               legend.text.direction=45)
+dev.off()
+
+# Define variable group containing the group column of datTrait
+# Group = as.data.frame(datTraits$Estradiol);
+# names(Group) = "Group"
+# names (colors) of the modules
+modNames = substring(names(MEs), 3)
+geneModuleMembership = as.data.frame(cor(datExpr, MEs, use = "p"));
+MMPvalue = as.data.frame(corPvalueStudent(as.matrix(geneModuleMembership), nSamples));
+names(geneModuleMembership) = paste("MM", modNames, sep="");
+names(MMPvalue) = paste("p.MM", modNames, sep="");
+geneTraitSignificance = as.data.frame(cor(datExpr, datTraits, use = "p"));
+GSPvalue = as.data.frame(corPvalueStudent(as.matrix(geneTraitSignificance), nSamples));
+names(geneTraitSignificance) = paste("GS.", names(datTraits), sep="");
+names(GSPvalue) = paste("p.GS.", names(datTraits), sep="");
+probes = names(datExpr)
+geneInfo0 = data.frame(Proteins = probes,
+                       moduleColor = moduleColors,
+                       geneTraitSignificance,
+                       GSPvalue)
+
+
+# Define variable group containing the group column of datTrait
+Group = as.data.frame(datTraits$Estradiol);
+names(Group) = "Group"
+modOrder = order(-abs(cor(MEs, Group, use = "p")));
+for (mod in 1:ncol(geneModuleMembership))
+{
+  oldNames = names(geneInfo0)
+  geneInfo0 = data.frame(geneInfo0, geneModuleMembership[, modOrder[mod]],
+                         MMPvalue[, modOrder[mod]]);
+  names(geneInfo0) = c(oldNames, paste("MM.", modNames[modOrder[mod]], sep=""),
+                       paste("p.MM.", modNames[modOrder[mod]], sep=""))
+}
+geneOrder = order(geneInfo0$moduleColor, -abs(geneInfo0$GS.Estradiol));
+geneInfo = geneInfo0[geneOrder, ]
+write.csv(geneInfo, file = paste0(resultsDirectory,"geneInfo.csv"))
+save(geneInfo,file=paste0(resultsDirectory,"geneInfo.RData"))
+
+geneInfoMerged=merge(x=geneInfo,y=dat_Regression,by.x="Proteins",by.y="ENSG")
+geneInfoMerged = geneInfoMerged[,c("hgnc_symbol",names(geneInfoMerged))]
+write.csv(geneInfoMerged,paste0(resultsDirectory,"geneInfo-mergedinfo.csv"))
+
+filterGenes = function(x)
+{
+  module = x
+  columnMM = paste0("MM.",module)
+  columnPMM = paste0("p.MM.",module)
+  geneInfo_Module = geneInfo[which(geneInfo$moduleColor==module),]
+  selectedGenes = intersect(which(geneInfo_Module[,columnMM]>0),
+                            which(geneInfo_Module[,columnPMM]<0.05))
+  row.names(geneInfo_Module[selectedGenes,])
+}
+modules = lapply(modNames,function(x) filterGenes(x))
+save(modules,modNames,file=paste0(resultsDirectory,"modules.RData"))
+```
+
+# 7. Extracting information about modules of interest
+
+```{r}
+l=load(file=paste0(resultsDirectory,"geneInfo.RData"))
+load(file=paste0(resultsDirectory,"modules.RData"))
+module="blue"
+column = match(module, modNames);
+moduleGenes = modules [[column]] #94 ensemble gene ids
+
+geneInfoModuleMerged=merge(x=geneInfo[moduleGenes,],y=dat_Regression,by.x="Proteins",by.y="ENSG")
+geneInfoModuleMerged = geneInfoModuleMerged[,c("hgnc_symbol",names(geneInfoModuleMerged))]
+write.csv(geneInfoModuleMerged,paste0(resultsDirectory,"-",module,"-mergedinfo.csv"))
+
+gene.symbols <- dat_Regression[match(moduleGenes,dat_Regression$ENSG),"hgnc_symbol"]
+write.csv(gene.symbols,file=paste0(resultsDirectory,module,".csv"))
+geneInfoModule <- geneInfo[moduleGenes,]
+geneInfoModule$symbol <- gene.symbols
+blueModule <- geneInfoModule$symbol
+
+write.csv(geneInfoModule,paste0(resultsDirectory,"-",module,"-info.csv"))
+
+geneInfoModule_filtered <- geneInfoModule %>% filter(p.MM.blue<0.05&MM.blue>0.5)
+blueModule_filtered <- geneInfoModule_filtered$symbol
+
+geneInfoModuleMerged_filtered=merge(x=geneInfoModule_filtered[moduleGenes,],y=dat_Regression,by.x="Proteins",by.y="ENSG")
+geneInfoModuleMerged_filtered = geneInfoModuleMerged_filtered[,c("hgnc_symbol",names(geneInfoModuleMerged_filtered))]
+
+write.csv(geneInfoModuleMerged_filtered,paste0(resultsDirectory,"-",module,"-filtered-mergedinfo.csv"))
+
+write.csv(geneInfoModule_filtered,paste0(resultsDirectory,"-",module,"-filtered-info.csv"))
+
+module="green"
+column = match(module, modNames);
+moduleGenes = modules [[column]] #94 ensemble gene ids
+
+geneInfoModuleMerged=merge(x=geneInfo[moduleGenes,],y=dat_Regression,by.x="Proteins",by.y="ENSG")
+geneInfoModuleMerged = geneInfoModuleMerged[,c("hgnc_symbol",names(geneInfoModuleMerged))]
+write.csv(geneInfoModuleMerged,paste0(resultsDirectory,"-",module,"-mergedinfo.csv"))
+
+gene.symbols <- dat_Regression[match(moduleGenes,dat_Regression$ENSG),"hgnc_symbol"]
+write.csv(gene.symbols,file=paste0(resultsDirectory,module,".csv"))
+geneInfoModule <- geneInfo[moduleGenes,]
+geneInfoModule$symbol <- gene.symbols
+greenModule <- geneInfoModule$symbol
+
+write.csv(geneInfoModule,paste0(resultsDirectory,"-",module,"-info.csv"))
+
+geneInfoModule_filtered <- geneInfoModule %>% filter(p.MM.green<0.05&MM.green>0.5)
+greenModule_filtered <- geneInfoModule_filtered$symbol
+
+geneInfoModuleMerged_filtered=merge(x=geneInfoModule_filtered[moduleGenes,],y=dat_Regression,by.x="Proteins",by.y="ENSG")
+geneInfoModuleMerged_filtered = geneInfoModuleMerged_filtered[,c("hgnc_symbol",names(geneInfoModuleMerged_filtered))]
+write.csv(geneInfoModuleMerged_filtered,paste0(resultsDirectory,"-",module,"-filtered-mergedinfo.csv"))
+
+write.csv(geneInfoModule_filtered,paste0(resultsDirectory,"-",module,"-filtered-info.csv"))
+```
+
+# 8. Finding overlap between modules of interest and results of regression analysis
+
+```{r}
+library(dplyr)
+table=data.frame()
+
+regressionResults <- read.csv(paste0(inputDirectory,"edgeR-model-v3.csv"))
+FDR_significant_down <- filter(regressionResults ,logFC_E2<0 & FDR_E2<0.05)
+Pval_significant_down <- filter(regressionResults ,logFC_E2<0 & PValue_E2<0.05)
+all_down <- filter(regressionResults ,logFC_E2<0)
+
+module <- read.csv(paste0(resultsDirectory,"-blue-info.csv"))
+b3=length(module[which(module$Proteins%in%FDR_significant_down$ENSG),"symbol"])
+b2=length(module[which(module$Proteins%in%Pval_significant_down$ENSG),"symbol"])
+b1=length(module[which(module$Proteins%in%all_down$ENSG),"symbol"])
+a3=dim(FDR_significant_down)[1]
+a2=dim(Pval_significant_down)[1]
+a1=dim(all_down)[1]
+a0=dim(module)[1]
+
+table=rbind(table,c(a0,a1,a2,a3,b1,b2,b3))
+
+module <- read.csv(paste0(resultsDirectory,"-blue-filtered-info.csv"))
+b3=length(module[which(module$Proteins%in%FDR_significant_down$ENSG),"symbol"])
+b2=length(module[which(module$Proteins%in%Pval_significant_down$ENSG),"symbol"])
+b1=length(module[which(module$Proteins%in%all_down$ENSG),"symbol"])
+a3=dim(FDR_significant_down)[1]
+a2=dim(Pval_significant_down)[1]
+a1=dim(all_down)[1]
+a0=dim(module)[1]
+
+table=rbind(table,c(a0,a1,a2,a3,b1,b2,b3))
+
+blueModule = FDR_significant_down$hgnc_symbol
+
+library(dplyr)
+regressionResults <- read.csv(paste0(inputDirectory,"edgeR-model-v3.csv"))
+FDR_significant_up <- filter(regressionResults ,logFC_E2>0 & FDR_E2<0.05)
+Pval_significant_up <- filter(regressionResults ,logFC_E2>0 & PValue_E2<0.05)
+all_up <- filter(regressionResults ,logFC_E2>0)
+
+module <- read.csv(paste0(resultsDirectory,"-green-info.csv"))
+b3=length(module[which(module$Proteins%in%FDR_significant_up$ENSG),"symbol"])
+b2=length(module[which(module$Proteins%in%Pval_significant_up$ENSG),"symbol"])
+b1=length(module[which(module$Proteins%in%all_up$ENSG),"symbol"])
+a3=dim(FDR_significant_up)[1]
+a2=dim(Pval_significant_up)[1]
+a1=dim(all_up)[1]
+a0=dim(module)[1]
+
+table=rbind(table,c(a0,a1,a2,a3,b1,b2,b3))
+
+module <- read.csv(paste0(resultsDirectory,"-green-filtered-info.csv"))
+b3=length(module[which(module$Proteins%in%FDR_significant_up$ENSG),"symbol"])
+b2=length(module[which(module$Proteins%in%Pval_significant_up$ENSG),"symbol"])
+b1=length(module[which(module$Proteins%in%all_up$ENSG),"symbol"])
+a3=dim(FDR_significant_up)[1]
+a2=dim(Pval_significant_up)[1]
+a1=dim(all_up)[1]
+a0=dim(module)[1]
+
+table=rbind(table,c(a0,a1,a2,a3,b1,b2,b3))
+names(table)= c("Number of genes in module", "number of all negative logFC from Olga", "number of sig Pvalue from Olga", "number of sig FDR from Olga", "overlap between logFC and module", "overlap between Pvalue and module", "overlap between FDR and module")
+row.names(table)=c("blue","blue-filtered","green","green-filtered")
+write.csv(table,file=paste(resultsDirectory,"-details about number of genes.csv"))
+greenModule = FDR_significant_up$hgnc_symbol
+```
+
+# 9. Functional enrichment analysis for modules of interest
+
+```{r}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichR)
+library(cowplot)
+library(xlsx)
+gene_list = blueModule_filtered
+col <- "blue"
+thr <- 0.05
+threshold <- 1.3
+point_size <- 6
+text_size <-
+dbs <- listEnrichrDbs()
+head(dbs)
+BPs <- c("GO_Biological_Process_2023")
+pathways <- c("KEGG_2021_Human")
+databases <- c("DisGeNET")
+TFs <- c("TRRUST_Transcription_Factors_2019")
+species <- "Homo sapiens"
+
+enriched <- enrichr(gene_list, BPs)
+result <- enriched[[1]]
+write.xlsx(result,file=paste0(resultsDirectory,"Functional enrichment results.xlsx"),sheetName = "GO terms-Blue module",append = T,row.names = F)
+
+result$val <- -log10(result$Adjusted.P.value)
+result <- result[1:10,]
+result$Term <- unlist(lapply(result$Term, function(x) sub("\\s*\\(.*", "", x)))
+result$num <- unlist(lapply(result$Overlap, function(x) unlist(strsplit(x, "/"))[1]))
+
+result <- result %>%
+  arrange(val) %>%    # First sort by val. This sort the dataframe but NOT the factor levels
+  mutate(Term=factor(Term, levels=Term))   # This trick update the factor levels
+p1 = ggplot(result, aes(x=Term, y=val))+
+    geom_segment( aes(xend=Term, yend=0)) +
+    geom_point(size=point_size, color=col) +
+    geom_text(aes(label = num), size=3, vjust = 0,hjust= 0.5,color="white") +
+    geom_hline(yintercept = threshold, color = "red", linetype = "dashed", size = 1) +
+    coord_flip() +
+    theme_bw() +
+    ylab("-log10(FDR pValue)")+
+    xlab("")
+
+enriched <- enrichr(gene_list, pathways)
+result <- enriched[[1]]
+write.xlsx(result,file=paste0(resultsDirectory,"Functional enrichment results.xlsx"),sheetName = "KEGG pathways-Blue module",append = T,row.names = F)
+
+result$val <- -log10(result$Adjusted.P.value)
+result <- result[1:5,]
+result$num <- unlist(lapply(result$Overlap, function(x) unlist(strsplit(x, "/"))[1]))
+
+result <- result %>%
+  arrange(val) %>%    # First sort by val. This sort the dataframe but NOT the factor levels
+  mutate(Term=factor(Term, levels=Term))  # This trick update the factor levels
+
+p2 <-  ggplot(result, aes(x=Term, y=val))+
+    geom_segment( aes(xend=Term, yend=0)) +
+    geom_point(size=point_size, color=col) +
+    geom_text(aes(label = num), size=3, vjust = 0,hjust= 0.5,color="white") +
+    geom_hline(yintercept = threshold, color = "red", linetype = "dashed", size = 1) +
+    coord_flip() +
+    theme_bw() +
+    ylab("-log10(FDR pValue)")+
+    xlab("")
+
+enriched <- enrichr(gene_list, TFs)
+result <- enriched[[1]]
+result <- result %>% filter(grepl("human",Term))
+write.xlsx(result,file=paste0(resultsDirectory,"Functional enrichment results.xlsx"),sheetName = "TRRUST-Blue module",append = T,row.names = F)
+result$val <- -log10(result$Adjusted.P.value)
+result <- result[1:5,]
+result$Term <- gsub("human","",result$Term)
+result$num <- unlist(lapply(result$Overlap, function(x) unlist(strsplit(x, "/"))[1]))
+
+result <- result %>%
+  arrange(val) %>%    # First sort by val. This sort the dataframe but NOT the factor levels
+  mutate(Term=factor(Term, levels=Term))    # This trick update the factor levels
+
+p3 <- ggplot(result, aes(x=Term, y=val))+
+    geom_segment( aes(xend=Term, yend=0)) +
+    geom_point(size=point_size, color=col) +
+    geom_text(aes(label = num), size=3, vjust = 0,hjust= 0.5,color="white") +
+    geom_hline(yintercept = threshold, color = "red", linetype = "dashed", size = 1) +
+    coord_flip() +
+    theme_bw() +
+    ylab("-log10(FDR pValue)")+
+    xlab("")
+
+gene_list = greenModule_filtered
+col <- "green"
+dbs <- listEnrichrDbs()
+head(dbs)
+BPs <- c("GO_Biological_Process_2021")
+pathways <- c("KEGG_2021_Human")
+databases <- c("DisGeNET")
+TFs <- c("TRRUST_Transcription_Factors_2019")
+species <- "Homo sapiens"
+
+enriched <- enrichr(gene_list, BPs)
+result <- enriched[[1]]
+write.xlsx(result,file=paste0(resultsDirectory,"Functional enrichment results.xlsx"),sheetName = "GO terms-Green module",append = T,row.names = F)
+
+result$val <- -log10(result$Adjusted.P.value)
+result <- result[1:10,]
+result$Term <- unlist(lapply(result$Term, function(x) sub("\\s*\\(.*", "", x)))
+result$num <- unlist(lapply(result$Overlap, function(x) unlist(strsplit(x, "/"))[1]))
+
+result <- result %>%
+  arrange(val) %>%    # First sort by val. This sort the dataframe but NOT the factor levels
+  mutate(Term=factor(Term, levels=Term))   # This trick update the factor levels
+
+p4 = ggplot(result, aes(x=Term, y=val))+
+    geom_segment( aes(xend=Term, yend=0)) +
+    geom_point(size=point_size, color=col) +
+    geom_text(aes(label = num), size=3, vjust = 0,hjust= 0.5) +
+    geom_hline(yintercept = threshold, color = "red", linetype = "dashed", size = 1) +
+    coord_flip() +
+    theme_bw() +
+    ylab("-log10(FDR pValue)")+
+    xlab("GO biological process")
+
+
+enriched <- enrichr(gene_list, pathways)
+result <- enriched[[1]]
+write.xlsx(result,file=paste0(resultsDirectory,"Functional enrichment results.xlsx"),sheetName = "KEGG pathways-Green module",append = T,row.names = F)
+
+result$val <- -log10(result$Adjusted.P.value)
+result <- result[1:5,]
+result$num <- unlist(lapply(result$Overlap, function(x) unlist(strsplit(x, "/"))[1]))
+
+result <- result %>%
+  arrange(val) %>%    # First sort by val. This sort the dataframe but NOT the factor levels
+  mutate(Term=factor(Term, levels=Term))  # This trick update the factor levels
+
+p5 <-  ggplot(result, aes(x=Term, y=val))+
+    geom_segment( aes(xend=Term, yend=0)) +
+    geom_point(size=point_size, color=col) +
+    geom_text(aes(label = num), size=3, vjust = 0,hjust= 0.5) +
+    geom_hline(yintercept = threshold, color = "red", linetype = "dashed", size = 1) +
+    coord_flip() +
+    theme_bw() +
+    ylab("-log10(FDR pValue)")+
+    xlab("KEGG Pathways")
+
+enriched <- enrichr(gene_list, TFs)
+result <- enriched[[1]]
+result <- result %>% filter(grepl("human",Term))
+write.xlsx(result,file=paste0(resultsDirectory,"Functional enrichment results.xlsx"),sheetName = "TRRUST-Green module",append = T,row.names = F)
+result$val <- -log10(result$Adjusted.P.value)
+result <- result[1:5,]
+result$Term <- gsub("human","",result$Term)
+result$num <- unlist(lapply(result$Overlap, function(x) unlist(strsplit(x, "/"))[1]))
+
+result <- result %>%
+  arrange(val) %>%    # First sort by val. This sort the dataframe but NOT the factor levels
+  mutate(Term=factor(Term, levels=Term))    # This trick update the factor levels
+
+p6 <- ggplot(result, aes(x=Term, y=val))+
+    geom_segment( aes(xend=Term, yend=0)) +
+    geom_point(size=point_size, color=col) +
+    geom_text(aes(label = num), size=3, vjust = 0,hjust= 0.5) +
+    geom_hline(yintercept = threshold, color = "red", linetype = "dashed", size = 1) +
+    coord_flip() +
+    theme_bw() +
+    ylab("-log10(FDR pValue)")+
+    xlab("TRRUST")
+
+
+pdf(paste0(resultsDirectory,"Functional enrichment results-ModulesFiltered.pdf"),width=12,height = 6)
+plot_grid(p4,p1,p5,p2,p6,p3,nrow=3,ncol=2,align="hv",rel_heights = c(1,0.5,0.5),rel_widths = c(1,1))
+dev.off()
+```
+
+# 10. Preservation analysis 
+
+```{r}
+l=load(paste0(resultsDirectory,"dataInput.RData"))
+datExprFirst=datExpr
+
+l=load("results/data-June-V2/Final results/bicor-signed hybridonlyHCdataInput.RData")
+datExprSecond=datExpr
+
+datExprFirst=datExprFirst[,intersect(names(datExprFirst),names(datExprSecond))]
+datExprSecond=datExprSecond[,intersect(names(datExprFirst),names(datExprSecond))]
+
+file=read.csv(paste0(resultsDirectory,"geneInfo.csv"))
+#file=read.csv("GeneInfo_Limma_Ordering(k_logFC).csv")
+
+row.names(file)=file$Proteins
+FirstColors=unlist(lapply(names(datExprFirst),function(x) file[x,"moduleColor"]))
+
+setLabels = c("First", "Second");
+multiExpr = list(First = list(data = datExprFirst), Second = list(data = datExprSecond));
+multiColor = list(First = FirstColors)
+
+system.time( {
+  mp = modulePreservation( multiExpr, multiColor,
+                          referenceNetworks = 1,
+                          nPermutations = 5,
+                          randomSeed = 1,
+                          quickCor = 0,
+                          verbose = 3)
+} );
+
+
+ref=1; test = 2
+Obs.PreservationStats= mp$preservation$observed[[ref]][[test]]
+Z.PreservationStats=mp$preservation$Z[[ref]][[test]]
+
+modColors = rownames(Obs.PreservationStats)
+moduleSize = Obs.PreservationStats$moduleSize
+# we will omit the grey module (background genes)
+# and the gold module (random sample of genes)
+selectModules = !(modColors %in% c("grey", "gold"))
+# Text labels for points
+point.label = modColors[selectModules]
+
+#Composite preservation statistics
+medianRank=Obs.PreservationStats$medianRank.pres
+Zsummary=Z.PreservationStats$Zsummary.pres
+dataPlot = data.frame(size=moduleSize[selectModules],Zsummary=Zsummary[selectModules],color=modColors[selectModules])
+
+
+pdf(paste0(resultsDirectory,"preservation.pdf"),width=4,height = 2.4)
+ggplot(dataPlot,aes(x=size,y=Zsummary,color=color))+
+  geom_point(size=3)+
+  scale_color_identity()+
+  scale_y_continuous(trans = "log10")+
+  labs(x="Module Size (genes)")+
+  geom_hline(yintercept = 10,color="red",linetype="dashed")+
+  theme_classic()+
+  theme(panel.border = element_rect(colour = "black",fill="NA"),axis.title=element_text(size=8),panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank())
+dev.off()
+```
+```
+
